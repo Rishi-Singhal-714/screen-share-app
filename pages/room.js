@@ -1,111 +1,345 @@
 import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/router';
-import dynamic from 'next/dynamic';
-import { WebRTCManager } from '../lib/webrtc-simple';
-
-const ScreenShare = dynamic(() => import('../components/ScreenShare'), { ssr: false });
-const VideoPlayer = dynamic(() => import('../components/VideoPlayer'), { ssr: false });
 
 export default function Room() {
-  const [userId] = useState(() => `user_${Date.now()}_${Math.random().toString(36).substr(2, 8)}`);
+  const router = useRouter();
+  const [isSharing, setIsSharing] = useState(false);
   const [localStream, setLocalStream] = useState(null);
   const [remoteStreams, setRemoteStreams] = useState([]);
-  const [isSharing, setIsSharing] = useState(false);
-  const [fullscreenStream, setFullscreenStream] = useState(null);
-  const [status, setStatus] = useState('Ready to share');
-  const [participants, setParticipants] = useState([]);
-  const router = useRouter();
-  const webrtcManager = useRef(null);
+  const [messages, setMessages] = useState([]);
+  const [fullscreenId, setFullscreenId] = useState(null);
+  
+  const peerConnections = useRef({});
+  const socketRef = useRef(null);
+  const userId = useRef(localStorage.getItem('userId') || `user_${Date.now()}`);
 
   useEffect(() => {
-    // Check authentication
-    const hasAccess = localStorage.getItem('hasAccess');
-    if (!hasAccess) {
+    // Check access
+    if (!localStorage.getItem('hasAccess')) {
       router.push('/');
       return;
     }
 
-    // Initialize WebRTC manager
-    webrtcManager.current = new WebRTCManager(userId, '251020031111222');
-    
-    // Set up remote stream handler
-    webrtcManager.current.onRemoteStream = (userId, stream) => {
-      console.log('Received remote stream from:', userId);
-      setRemoteStreams(prev => {
-        // Remove old stream from same user
-        const filtered = prev.filter(s => s.userId !== userId);
-        return [...filtered, { userId, stream }];
-      });
-      setParticipants(prev => {
-        if (!prev.includes(userId)) {
-          return [...prev, userId];
-        }
-        return prev;
-      });
-    };
-
-    // Initialize socket
-    webrtcManager.current.initSocket();
+    // Initialize Socket.io
+    initSocket();
 
     return () => {
-      if (webrtcManager.current) {
-        webrtcManager.current.stop();
+      // Cleanup
+      if (socketRef.current) socketRef.current.disconnect();
+      Object.values(peerConnections.current).forEach(pc => pc.close());
+      if (localStream) {
+        localStream.getTracks().forEach(track => track.stop());
       }
     };
   }, []);
 
-  const startSharing = () => {
-    setIsSharing(true);
-    setStatus('Starting screen share...');
+  const initSocket = () => {
+    // Use a free public signaling server for demo
+    const socket = new WebSocket('wss://websocket-echo.onrender.com');
+    
+    socket.onopen = () => {
+      console.log('Connected to signaling server');
+      socket.send(JSON.stringify({
+        type: 'join',
+        userId: userId.current,
+        room: '251020031111222'
+      }));
+    };
+
+    socket.onmessage = async (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        console.log('Received:', data);
+        
+        switch (data.type) {
+          case 'user-joined':
+            if (data.userId !== userId.current) {
+              await handleUserJoined(data.userId);
+            }
+            break;
+            
+          case 'offer':
+            await handleOffer(data);
+            break;
+            
+          case 'answer':
+            await handleAnswer(data);
+            break;
+            
+          case 'ice-candidate':
+            await handleIceCandidate(data);
+            break;
+            
+          case 'user-left':
+            handleUserLeft(data.userId);
+            break;
+        }
+      } catch (error) {
+        console.log('Message parse error:', error);
+      }
+    };
+
+    socket.onerror = (error) => {
+      console.error('Socket error:', error);
+    };
+
+    socketRef.current = socket;
   };
 
-  const stopSharing = () => {
+  const sendSignal = (data) => {
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify(data));
+    }
+  };
+
+  const createPeerConnection = async (targetUserId) => {
+    const config = {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+      ]
+    };
+
+    const pc = new RTCPeerConnection(config);
+    peerConnections.current[targetUserId] = pc;
+
+    // Add local stream if available
+    if (localStream) {
+      localStream.getTracks().forEach(track => {
+        pc.addTrack(track, localStream);
+      });
+    }
+
+    // Handle remote stream
+    pc.ontrack = (event) => {
+      console.log('Received remote track from', targetUserId);
+      const stream = event.streams[0];
+      if (stream) {
+        setRemoteStreams(prev => {
+          const existing = prev.find(s => s.userId === targetUserId);
+          if (existing) {
+            return prev.map(s => s.userId === targetUserId ? { ...s, stream } : s);
+          }
+          return [...prev, { userId: targetUserId, stream }];
+        });
+      }
+    };
+
+    // Handle ICE candidates
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        sendSignal({
+          type: 'ice-candidate',
+          from: userId.current,
+          to: targetUserId,
+          candidate: event.candidate
+        });
+      }
+    };
+
+    return pc;
+  };
+
+  const handleUserJoined = async (newUserId) => {
+    console.log('New user joined:', newUserId);
+    
+    // Create peer connection
+    const pc = await createPeerConnection(newUserId);
+    
+    // Create offer
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      
+      sendSignal({
+        type: 'offer',
+        from: userId.current,
+        to: newUserId,
+        sdp: offer
+      });
+    } catch (error) {
+      console.error('Error creating offer:', error);
+    }
+  };
+
+  const handleOffer = async (data) => {
+    const pc = await createPeerConnection(data.from);
+    
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+      
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      
+      sendSignal({
+        type: 'answer',
+        from: userId.current,
+        to: data.from,
+        sdp: answer
+      });
+    } catch (error) {
+      console.error('Error handling offer:', error);
+    }
+  };
+
+  const handleAnswer = async (data) => {
+    const pc = peerConnections.current[data.from];
+    if (pc) {
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+      } catch (error) {
+        console.error('Error handling answer:', error);
+      }
+    }
+  };
+
+  const handleIceCandidate = async (data) => {
+    const pc = peerConnections.current[data.from];
+    if (pc && data.candidate) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+      } catch (error) {
+        console.error('Error adding ICE candidate:', error);
+      }
+    }
+  };
+
+  const handleUserLeft = (userId) => {
+    const pc = peerConnections.current[userId];
+    if (pc) {
+      pc.close();
+      delete peerConnections.current[userId];
+    }
+    setRemoteStreams(prev => prev.filter(s => s.userId !== userId));
+  };
+
+  const startScreenShare = async () => {
+    try {
+      console.log('Requesting screen share...');
+      
+      // Get screen with audio
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: {
+          cursor: 'always',
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        },
+        audio: true
+      });
+
+      console.log('Got screen stream:', stream);
+      setLocalStream(stream);
+      setIsSharing(true);
+
+      // Add stream to existing peer connections
+      Object.values(peerConnections.current).forEach(pc => {
+        stream.getTracks().forEach(track => {
+          const sender = pc.getSenders().find(s => s.track?.kind === track.kind);
+          if (sender) {
+            sender.replaceTrack(track);
+          } else {
+            pc.addTrack(track, stream);
+          }
+        });
+      });
+
+      // Notify others
+      sendSignal({
+        type: 'screen-sharing',
+        from: userId.current,
+        isSharing: true
+      });
+
+      // Handle when user stops sharing via browser
+      stream.getVideoTracks()[0].onended = () => {
+        stopScreenShare();
+      };
+
+    } catch (error) {
+      console.error('Screen share error:', error);
+      alert('Failed to share screen. Please allow permissions.');
+    }
+  };
+
+  const stopScreenShare = () => {
     if (localStream) {
       localStream.getTracks().forEach(track => track.stop());
       setLocalStream(null);
     }
     setIsSharing(false);
-    setStatus('Screen sharing stopped');
-  };
-
-  const handleStreamReady = (stream) => {
-    console.log('Local stream ready');
-    setLocalStream(stream);
-    setStatus('Screen sharing active');
     
-    // Set stream in WebRTC manager
-    if (webrtcManager.current) {
-      webrtcManager.current.setLocalStream(stream);
-    }
-  };
-
-  const handleStreamEnd = () => {
-    console.log('Local stream ended');
-    setLocalStream(null);
-    setIsSharing(false);
-    setStatus('Screen sharing stopped');
-    
-    // Clear stream in WebRTC manager
-    if (webrtcManager.current) {
-      webrtcManager.current.setLocalStream(null);
-    }
+    sendSignal({
+      type: 'screen-sharing',
+      from: userId.current,
+      isSharing: false
+    });
   };
 
   const leaveRoom = () => {
-    if (webrtcManager.current) {
-      webrtcManager.current.stop();
-    }
+    // Cleanup
+    Object.values(peerConnections.current).forEach(pc => pc.close());
+    peerConnections.current = {};
+    
     if (localStream) {
       localStream.getTracks().forEach(track => track.stop());
     }
+    
     localStorage.removeItem('hasAccess');
     router.push('/');
+  };
+
+  const renderVideo = (stream, title, isLocal = false) => {
+    if (!stream) return null;
+    
+    return (
+      <div style={{
+        position: 'relative',
+        backgroundColor: '#000',
+        borderRadius: '10px',
+        overflow: 'hidden',
+        border: isLocal ? '3px solid #00ff88' : '2px solid #333',
+        height: '250px'
+      }}>
+        <video
+          autoPlay
+          playsInline
+          muted={isLocal}
+          ref={(video) => {
+            if (video) video.srcObject = stream;
+          }}
+          style={{
+            width: '100%',
+            height: '100%',
+            objectFit: 'contain',
+            background: '#000'
+          }}
+        />
+        <div style={{
+          position: 'absolute',
+          bottom: 0,
+          left: 0,
+          right: 0,
+          background: 'rgba(0,0,0,0.7)',
+          color: 'white',
+          padding: '8px',
+          fontSize: '14px',
+          display: 'flex',
+          justifyContent: 'space-between'
+        }}>
+          <span>{title}</span>
+          <span style={{ color: '#00ff88' }}>
+            {isLocal ? '🔴 LIVE' : '📺'}
+          </span>
+        </div>
+      </div>
+    );
   };
 
   return (
     <div style={{
       minHeight: '100vh',
-      backgroundColor: '#1a1a1a',
+      background: 'linear-gradient(135deg, #0f0f0f 0%, #1a1a1a 100%)',
       color: 'white',
       padding: '20px',
       fontFamily: 'Arial, sans-serif'
@@ -120,285 +354,195 @@ export default function Room() {
         gap: '20px'
       }}>
         <div>
-          <h1 style={{ margin: 0, color: '#4CAF50' }}>Screen Share Room</h1>
-          <p style={{ margin: '5px 0 0 0', color: '#aaa', fontSize: '14px' }}>
-            Room: 251020031111222 • Participants: {participants.length + 1}
-          </p>
-          <p style={{ margin: '5px 0 0 0', color: '#4CAF50', fontSize: '14px' }}>
-            Status: {status}
+          <h1 style={{ margin: 0, color: '#00ff88' }}>🎥 Screen Share Room</h1>
+          <p style={{ margin: '5px 0', color: '#888' }}>
+            Room Code: <strong>251020031111222</strong> • 
+            Your ID: <code style={{ background: '#2a2a2a', padding: '2px 5px', borderRadius: '3px' }}>
+              {userId.current.substring(0, 8)}
+            </code>
           </p>
         </div>
-        <div style={{ display: 'flex', gap: '10px' }}>
-          <button
-            onClick={() => navigator.clipboard.writeText('251020031111222')}
-            style={{
-              padding: '10px 15px',
-              backgroundColor: '#2196F3',
-              color: 'white',
-              border: 'none',
-              borderRadius: '5px',
-              cursor: 'pointer'
-            }}
-          >
-            Copy Room Code
-          </button>
-          <button
-            onClick={leaveRoom}
-            style={{
-              padding: '10px 20px',
-              backgroundColor: '#ff4444',
-              color: 'white',
-              border: 'none',
-              borderRadius: '5px',
-              cursor: 'pointer'
-            }}
-          >
-            Leave Room
-          </button>
-        </div>
+        <button
+          onClick={leaveRoom}
+          style={{
+            padding: '10px 20px',
+            background: '#ff4444',
+            color: 'white',
+            border: 'none',
+            borderRadius: '5px',
+            cursor: 'pointer',
+            fontWeight: 'bold'
+          }}
+        >
+          Leave Room
+        </button>
       </div>
 
-      {/* Fullscreen View */}
-      {fullscreenStream && (
+      {/* Main Content */}
+      <div style={{ display: 'grid', gap: '30px' }}>
+        
+        {/* Your Screen Section */}
         <div style={{
-          position: 'fixed',
-          top: 0,
-          left: 0,
-          width: '100vw',
-          height: '100vh',
-          backgroundColor: 'black',
-          zIndex: 1000
+          background: '#1a1a1a',
+          padding: '20px',
+          borderRadius: '10px'
         }}>
-          <VideoPlayer
-            stream={fullscreenStream}
-            isFullscreen={true}
-            onExit={() => setFullscreenStream(null)}
-          />
-          <button
-            onClick={() => setFullscreenStream(null)}
-            style={{
-              position: 'absolute',
-              top: '20px',
-              right: '20px',
-              padding: '10px 20px',
-              backgroundColor: 'rgba(255,0,0,0.7)',
-              color: 'white',
-              border: 'none',
-              borderRadius: '5px',
-              cursor: 'pointer',
-              zIndex: 1001
-            }}
-          >
-            Exit Fullscreen (ESC)
-          </button>
-        </div>
-      )}
-
-      {/* Control Panel */}
-      <div style={{
-        position: 'fixed',
-        bottom: '30px',
-        left: '50%',
-        transform: 'translateX(-50%)',
-        backgroundColor: 'rgba(0,0,0,0.8)',
-        padding: '15px 25px',
-        borderRadius: '15px',
-        backdropFilter: 'blur(10px)',
-        border: '1px solid #444',
-        zIndex: 100,
-        display: 'flex',
-        gap: '15px'
-      }}>
-        {!isSharing ? (
-          <button
-            onClick={startSharing}
-            style={{
-              padding: '12px 30px',
-              backgroundColor: '#4CAF50',
-              color: 'white',
-              border: 'none',
-              borderRadius: '8px',
-              cursor: 'pointer',
-              fontSize: '16px',
-              fontWeight: 'bold',
+          <h2 style={{ color: '#00ff88', marginBottom: '15px' }}>
+            {isSharing ? '🎬 Your Shared Screen' : 'Your Screen'}
+          </h2>
+          
+          {localStream ? (
+            renderVideo(localStream, 'You (Host)', true)
+          ) : (
+            <div style={{
+              background: '#2a2a2a',
+              height: '250px',
               display: 'flex',
               alignItems: 'center',
-              gap: '10px'
-            }}
-          >
-            📺 Start Sharing Screen
-          </button>
-        ) : (
-          <button
-            onClick={stopSharing}
-            style={{
-              padding: '12px 30px',
-              backgroundColor: '#ff4444',
-              color: 'white',
-              border: 'none',
-              borderRadius: '8px',
-              cursor: 'pointer',
-              fontSize: '16px',
-              fontWeight: 'bold',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '10px'
-            }}
-          >
-            ⏹️ Stop Sharing
-          </button>
-        )}
-      </div>
-
-      {/* Screen Share Component */}
-      {isSharing && (
-        <ScreenShare
-          onStreamReady={handleStreamReady}
-          onStreamEnd={handleStreamEnd}
-          audioEnabled={true}
-        />
-      )}
-
-      {/* Content Area */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '40px' }}>
-        {/* Local Stream */}
-        {localStream && (
-          <div>
-            <h2>🎥 Your Screen (Shared with others)</h2>
-            <div
-              onClick={() => setFullscreenStream(localStream)}
-              style={{
-                cursor: 'pointer',
-                maxWidth: '800px',
-                borderRadius: '10px',
-                overflow: 'hidden',
-                border: '3px solid #4CAF50',
-                backgroundColor: '#000'
-              }}
-            >
-              <VideoPlayer
-                stream={localStream}
-                isFullscreen={false}
-              />
-              <div style={{
-                padding: '10px',
-                backgroundColor: '#2a2a2a',
-                textAlign: 'center',
-                color: '#4CAF50',
-                fontWeight: 'bold'
-              }}>
-                🔴 LIVE - You are sharing
+              justifyContent: 'center',
+              borderRadius: '10px',
+              color: '#888',
+              textAlign: 'center'
+            }}>
+              <div>
+                <div style={{ fontSize: '48px', marginBottom: '10px' }}>📺</div>
+                <p>Screen not sharing</p>
               </div>
             </div>
+          )}
+          
+          {/* Share Controls */}
+          <div style={{ marginTop: '20px', display: 'flex', gap: '10px' }}>
+            {!isSharing ? (
+              <button
+                onClick={startScreenShare}
+                style={{
+                  padding: '12px 24px',
+                  background: '#00ff88',
+                  color: '#000',
+                  border: 'none',
+                  borderRadius: '5px',
+                  cursor: 'pointer',
+                  fontWeight: 'bold',
+                  fontSize: '16px'
+                }}
+              >
+                📺 Start Sharing Screen
+              </button>
+            ) : (
+              <button
+                onClick={stopScreenShare}
+                style={{
+                  padding: '12px 24px',
+                  background: '#ff4444',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '5px',
+                  cursor: 'pointer',
+                  fontWeight: 'bold',
+                  fontSize: '16px'
+                }}
+              >
+                ⏹ Stop Sharing
+              </button>
+            )}
           </div>
-        )}
+        </div>
 
-        {/* Remote Streams */}
-        {remoteStreams.length > 0 && (
-          <div>
-            <h2>👥 Other Participants ({remoteStreams.length})</h2>
+        {/* Others' Screens */}
+        <div style={{
+          background: '#1a1a1a',
+          padding: '20px',
+          borderRadius: '10px'
+        }}>
+          <h2 style={{ color: '#00ff88', marginBottom: '15px' }}>
+            👥 Other Participants ({remoteStreams.length})
+          </h2>
+          
+          {remoteStreams.length > 0 ? (
             <div style={{
               display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fill, minmax(350px, 1fr))',
-              gap: '25px'
+              gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))',
+              gap: '20px'
             }}>
-              {remoteStreams.map((remote) => (
-                <div
-                  key={remote.userId}
-                  onClick={() => setFullscreenStream(remote.stream)}
-                  style={{
-                    cursor: 'pointer',
-                    backgroundColor: '#2a2a2a',
-                    borderRadius: '10px',
-                    overflow: 'hidden',
-                    transition: 'transform 0.2s',
-                    border: '2px solid #2196F3'
-                  }}
-                  onMouseOver={(e) => e.currentTarget.style.transform = 'scale(1.02)'}
-                  onMouseOut={(e) => e.currentTarget.style.transform = 'scale(1)'}
-                >
-                  <VideoPlayer
-                    stream={remote.stream}
-                    isFullscreen={false}
-                  />
+              {remoteStreams.map((remote, index) => (
+                <div key={remote.userId}>
+                  {renderVideo(remote.stream, `Participant ${index + 1}`)}
                   <div style={{
-                    padding: '15px',
+                    marginTop: '10px',
                     textAlign: 'center',
-                    backgroundColor: '#333',
-                    borderTop: '1px solid #444'
+                    fontSize: '12px',
+                    color: '#888'
                   }}>
-                    <div style={{ color: '#2196F3', fontWeight: 'bold' }}>
-                      Participant {remote.userId.substring(0, 8)}
-                    </div>
-                    <div style={{ fontSize: '12px', color: '#888', marginTop: '5px' }}>
-                      Click to view fullscreen
-                    </div>
+                    ID: {remote.userId.substring(0, 8)}
                   </div>
                 </div>
               ))}
             </div>
-          </div>
-        )}
+          ) : (
+            <div style={{
+              background: '#2a2a2a',
+              padding: '40px',
+              borderRadius: '10px',
+              textAlign: 'center',
+              color: '#888'
+            }}>
+              <div style={{ fontSize: '48px', marginBottom: '20px' }}>👤</div>
+              <h3>Waiting for others to join...</h3>
+              <p style={{ marginTop: '10px' }}>
+                Share this room code with others: <strong>251020031111222</strong>
+              </p>
+            </div>
+          )}
+        </div>
 
         {/* Instructions */}
         <div style={{
-          marginTop: '50px',
-          padding: '25px',
-          backgroundColor: '#2a2a2a',
-          borderRadius: '10px',
-          borderLeft: '4px solid #4CAF50'
+          background: 'rgba(0, 255, 136, 0.1)',
+          borderLeft: '4px solid #00ff88',
+          padding: '20px',
+          borderRadius: '5px',
+          fontSize: '14px'
         }}>
-          <h3 style={{ color: '#fff', marginBottom: '15px' }}>📋 How to Connect Multiple Devices</h3>
-          <ol style={{ lineHeight: '1.8', paddingLeft: '20px', color: '#ccc' }}>
-            <li><strong>Device 1:</strong> Start sharing your screen using the green button</li>
-            <li><strong>Device 2:</strong> Open this app on another device/computer</li>
-            <li><strong>Device 2:</strong> Enter the same room code: <code style={{ backgroundColor: '#444', padding: '2px 5px', borderRadius: '3px' }}>251020031111222</code></li>
-            <li><strong>Device 2:</strong> Wait a few seconds - you should see Device 1's screen automatically</li>
-            <li><strong>Both devices:</strong> Click on any video to view in fullscreen mode</li>
-            <li><strong>To stop:</strong> Click the red "Stop Sharing" button or leave the room</li>
+          <h3 style={{ color: '#00ff88', marginTop: 0 }}>📋 How to Connect Multiple Devices:</h3>
+          <ol style={{ lineHeight: '2', paddingLeft: '20px' }}>
+            <li><strong>Device 1:</strong> Click "Start Sharing Screen" - select screen/window to share</li>
+            <li><strong>Device 2:</strong> Open this app in another browser/device</li>
+            <li><strong>Device 2:</strong> Enter code: <code style={{ background: '#2a2a2a', padding: '2px 5px' }}>251020031111222</code></li>
+            <li><strong>Device 2:</strong> Wait a few seconds - should see Device 1's screen automatically</li>
+            <li>Works on Chrome, Edge, Firefox on desktop</li>
           </ol>
-          
-          <div style={{ marginTop: '20px', padding: '15px', backgroundColor: '#333', borderRadius: '5px' }}>
-            <p style={{ margin: 0, color: '#4CAF50' }}>
-              💡 <strong>Tip:</strong> Make sure both devices are on the same network for best performance.
-              The screen sharing works in the background - you can minimize the browser tab.
-            </p>
-          </div>
+          <p style={{ marginTop: '15px', color: '#00ff88' }}>
+            💡 <strong>Note:</strong> Both devices must be on the same WiFi network for best results
+          </p>
         </div>
 
-        {/* Connection Status */}
+        {/* Debug Info */}
         <div style={{
+          background: '#2a2a2a',
           padding: '15px',
-          backgroundColor: participants.length > 0 ? 'rgba(76, 175, 80, 0.1)' : 'rgba(255, 193, 7, 0.1)',
-          borderRadius: '10px',
-          border: `1px solid ${participants.length > 0 ? '#4CAF50' : '#FFC107'}`,
-          textAlign: 'center'
+          borderRadius: '5px',
+          fontSize: '12px',
+          color: '#888'
         }}>
-          {participants.length > 0 ? (
-            <div style={{ color: '#4CAF50' }}>
-              ✅ Connected to {participants.length} other device{participants.length > 1 ? 's' : ''}
-            </div>
-          ) : (
-            <div style={{ color: '#FFC107' }}>
-              ⚡ Waiting for other devices to join... Share the room code with others
-            </div>
-          )}
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span>Status: {socketRef.current?.readyState === 1 ? '✅ Connected' : '❌ Disconnected'}</span>
+            <span>Peer Connections: {Object.keys(peerConnections.current).length}</span>
+            <span>Streams: {remoteStreams.length + (localStream ? 1 : 0)}</span>
+          </div>
         </div>
       </div>
 
       {/* Footer */}
       <div style={{
-        marginTop: '50px',
+        marginTop: '40px',
         paddingTop: '20px',
         borderTop: '1px solid #333',
         textAlign: 'center',
         color: '#666',
         fontSize: '12px'
       }}>
-        <p>
-          Screen Share App • Room Code: 251020031111222 • 
-          Your ID: <code>{userId.substring(0, 8)}</code>
-        </p>
+        <p>Screen Share App • Simple P2P Sharing • No login required</p>
       </div>
     </div>
   );
