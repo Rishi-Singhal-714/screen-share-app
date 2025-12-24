@@ -1,62 +1,59 @@
 import { useEffect, useRef } from 'react';
 
-export default function VideoPlayer({ stream, isFullscreen, onExit, streamId }) {
+export default function VideoPlayer({ stream, isFullscreen, onExit }) {
   const videoRef = useRef(null);
 
   useEffect(() => {
     if (videoRef.current && stream) {
       videoRef.current.srcObject = stream;
       
-      // Try to play the video
-      const playVideo = async () => {
-        try {
-          await videoRef.current.play();
-        } catch (err) {
-          console.log('Autoplay prevented:', err);
-          // Add play button overlay
-          const playButton = document.createElement('button');
-          playButton.innerHTML = '▶ Play';
-          playButton.style.position = 'absolute';
-          playButton.style.top = '50%';
-          playButton.style.left = '50%';
-          playButton.style.transform = 'translate(-50%, -50%)';
-          playButton.style.padding = '10px 20px';
-          playButton.style.backgroundColor = 'rgba(0,0,0,0.7)';
-          playButton.style.color = 'white';
-          playButton.style.border = 'none';
-          playButton.style.borderRadius = '5px';
-          playButton.style.cursor = 'pointer';
-          playButton.style.zIndex = '10';
-          
-          playButton.onclick = async () => {
-            try {
-              await videoRef.current.play();
-              playButton.remove();
-            } catch (err) {
-              console.log('Still cannot play:', err);
-            }
-          };
-          
-          if (videoRef.current.parentNode) {
-            videoRef.current.parentNode.style.position = 'relative';
-            videoRef.current.parentNode.appendChild(playButton);
-          }
-        }
-      };
-      
-      playVideo();
+      // Try to autoplay
+      videoRef.current.play().catch(err => {
+        console.log('Autoplay prevented:', err);
+        // Add click-to-play overlay
+        const playOverlay = document.createElement('div');
+        playOverlay.innerHTML = 'Click to play';
+        playOverlay.style.cssText = `
+          position: absolute;
+          top: 50%;
+          left: 50%;
+          transform: translate(-50%, -50%);
+          background: rgba(0,0,0,0.7);
+          color: white;
+          padding: 10px 20px;
+          border-radius: 5px;
+          cursor: pointer;
+          z-index: 10;
+        `;
+        playOverlay.onclick = () => {
+          videoRef.current.play();
+          playOverlay.remove();
+        };
+        videoRef.current.parentNode.appendChild(playOverlay);
+      });
     }
   }, [stream]);
 
+  useEffect(() => {
+    // Handle ESC key to exit fullscreen
+    const handleEsc = (e) => {
+      if (e.key === 'Escape' && isFullscreen && onExit) {
+        onExit();
+      }
+    };
+    
+    window.addEventListener('keydown', handleEsc);
+    return () => window.removeEventListener('keydown', handleEsc);
+  }, [isFullscreen, onExit]);
+
   return (
     <div style={{
-      width: isFullscreen ? '100%' : '100%',
-      height: isFullscreen ? '100%' : '200px',
+      width: '100%',
+      height: isFullscreen ? '100vh' : 'auto',
       backgroundColor: 'black',
       position: 'relative'
     }}>
       <video
-        id={`video-${streamId}`}
         ref={videoRef}
         autoPlay
         playsInline
@@ -78,11 +75,10 @@ export default function VideoPlayer({ stream, isFullscreen, onExit, streamId }) 
             backgroundColor: 'rgba(255,0,0,0.7)',
             color: 'white',
             border: 'none',
-            padding: '10px 20px',
-            cursor: 'pointer',
+            padding: '10px',
             borderRadius: '5px',
-            fontWeight: 'bold',
-            zIndex: 1001
+            cursor: 'pointer',
+            zIndex: 100
           }}
         >
           Exit Fullscreen (ESC)
